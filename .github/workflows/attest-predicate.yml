@@ -1,0 +1,218 @@
+name: actions attest predicate path trust split
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: regular
+            path: data/regular.json
+            expected: public
+          - case: safe-link
+            path: data/safe-link.json
+            expected: public
+          - case: leaf-abs
+            path: data/leaf-abs.json
+            expected: protected
+          - case: leaf-rel
+            path: data/leaf-rel.json
+            expected: protected
+          - case: chain-abs
+            path: data/chain-abs.json
+            expected: protected
+          - case: chain-rel
+            path: data/chain-rel.json
+            expected: protected
+          - case: parent-abs
+            path: parent-abs/predicate.json
+            expected: protected
+          - case: parent-rel
+            path: parent-rel/predicate.json
+            expected: protected
+          - case: broken
+            path: data/broken.json
+            expected: reject
+          - case: malformed
+            path: data/malformed.json
+            expected: reject
+          - case: directory
+            path: data/directory
+            expected: reject
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: StealthyBugs/attest-predicate-data-1116192735-e1eb
+          ref: ca786ad8f7d06f8fbdb300eafc0d9f336f0777f6
+          persist-credentials: false
+      - name: Create runtime-only protected predicate
+        shell: bash
+        env:
+          CASE_NAME: ${{ matrix.case }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,secrets
+          case=os.environ['CASE_NAME']
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          path=(root/f'owner-{case}'/ 'predicate.json') if case.startswith('parent-') else (root/f'owner-{case}.json')
+          path.parent.mkdir(parents=True,exist_ok=True)
+          value={'case':case,'protected_runtime':secrets.token_urlsafe(48)}
+          raw=json.dumps(value,sort_keys=True,separators=(',',':'))
+          path.write_text(raw)
+          (root/'owner-meta.json').write_text(json.dumps({'path':str(path),'predicate_sha256':hashlib.sha256(raw.encode()).hexdigest()},sort_keys=True,separators=(',',':')))
+          PY
+      - name: Attest matrix predicate
+        id: attest
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: owned-actions-attest-predicate-boundary
+          subject-digest: sha256:f74173fda9f3b0a8f18a6af4be3c2c91789e1365960b98fdb764f2187f35f351
+          predicate-type: https://controlled.invalid/predicate-path/v1
+          predicate-path: ${{ matrix.path }}
+          show-summary: false
+      - name: Owner exact projection
+        if: always()
+        shell: bash
+        env:
+          CASE_NAME: ${{ matrix.case }}
+          EXPECTED: ${{ matrix.expected }}
+          OUTCOME: ${{ steps.attest.outcome }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          meta=json.loads((root/'owner-meta.json').read_text())
+          hashes=[]; cases=[]
+          p=pathlib.Path(os.environ.get('BUNDLE_PATH',''))
+          if p.is_file():
+            for line in p.read_text().splitlines():
+              if not line: continue
+              b=json.loads(line); s=json.loads(base64.b64decode(b['dsseEnvelope']['payload']))
+              pred=s.get('predicate'); raw=json.dumps(pred,sort_keys=True,separators=(',',':'))
+              hashes.append(hashlib.sha256(raw.encode()).hexdigest())
+              if isinstance(pred,dict): cases.append(pred.get('case'))
+          row={'case':os.environ['CASE_NAME'],'expected':os.environ['EXPECTED'],'outcome':os.environ['OUTCOME'],'owner_predicate_sha256':meta['predicate_sha256'],'bundle_predicate_sha256':hashes,'bundle_case_values':cases,'exact_owner_predicate':meta['predicate_sha256'] in hashes,'attestation_id_present':bool(os.environ.get('ATTESTATION_ID'))}
+          print('ATTEST_PREDICATE_PROJECTION '+json.dumps(row,sort_keys=True,separators=(',',':')))
+          PY
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: StealthyBugs/attest-predicate-data-1116192735-e1eb
+          ref: ca786ad8f7d06f8fbdb300eafc0d9f336f0777f6
+          persist-credentials: false
+      - name: Create direct owner predicate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,secrets
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'owner-direct.json'
+          raw=json.dumps({'case':'direct','protected_runtime':secrets.token_urlsafe(48)},sort_keys=True,separators=(',',':'))
+          p.write_text(raw); (p.parent/'owner-meta.json').write_text(json.dumps({'predicate_sha256':hashlib.sha256(raw.encode()).hexdigest()},sort_keys=True,separators=(',',':')))
+          PY
+      - name: Attest direct owner path positive
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: owned-actions-attest-predicate-boundary
+          subject-digest: sha256:f74173fda9f3b0a8f18a6af4be3c2c91789e1365960b98fdb764f2187f35f351
+          predicate-type: https://controlled.invalid/predicate-path/v1
+          predicate-path: ${{ runner.temp }}/owner-direct.json
+          show-summary: false
+      - name: Project direct positive
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.attest.outcome }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); meta=json.loads((root/'owner-meta.json').read_text()); hashes=[]
+          p=pathlib.Path(os.environ.get('BUNDLE_PATH',''))
+          if p.is_file():
+            for line in p.read_text().splitlines():
+              if not line: continue
+              s=json.loads(base64.b64decode(json.loads(line)['dsseEnvelope']['payload'])); hashes.append(hashlib.sha256(json.dumps(s.get('predicate'),sort_keys=True,separators=(',',':')).encode()).hexdigest())
+          row={'case':'direct','expected':'protected-control','outcome':os.environ['OUTCOME'],'owner_predicate_sha256':meta['predicate_sha256'],'bundle_predicate_sha256':hashes,'exact_owner_predicate':meta['predicate_sha256'] in hashes,'attestation_id_present':bool(os.environ.get('ATTESTATION_ID'))}
+          print('ATTEST_PREDICATE_PROJECTION '+json.dumps(row,sort_keys=True,separators=(',',':')))
+          PY
+  collision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: StealthyBugs/attest-predicate-data-1116192735-e1eb
+          ref: ca786ad8f7d06f8fbdb300eafc0d9f336f0777f6
+          persist-credentials: false
+      - name: Create collision predicate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,secrets
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'owner-collision.json'
+          raw=json.dumps({'case':'collision','protected_runtime':secrets.token_urlsafe(48)},sort_keys=True,separators=(',',':'))
+          p.write_text(raw); (p.parent/'owner-meta.json').write_text(json.dumps({'predicate_sha256':hashlib.sha256(raw.encode()).hexdigest()},sort_keys=True,separators=(',',':')))
+          PY
+      - name: Attest collision first
+        id: first
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: owned-actions-attest-predicate-boundary
+          subject-digest: sha256:f74173fda9f3b0a8f18a6af4be3c2c91789e1365960b98fdb764f2187f35f351
+          predicate-type: https://controlled.invalid/predicate-path/v1
+          predicate-path: data/collision.json
+          show-summary: false
+      - name: Project collision first
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.first.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.first.outputs.attestation-id }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); meta=json.loads((root/'owner-meta.json').read_text()); hashes=[]; p=pathlib.Path(os.environ.get('BUNDLE_PATH',''))
+          if p.is_file():
+            for line in p.read_text().splitlines():
+              if line:
+                s=json.loads(base64.b64decode(json.loads(line)['dsseEnvelope']['payload'])); hashes.append(hashlib.sha256(json.dumps(s.get('predicate'),sort_keys=True,separators=(',',':')).encode()).hexdigest())
+          print('ATTEST_PREDICATE_PROJECTION '+json.dumps({'case':'collision-first','expected':'protected','outcome':'success','owner_predicate_sha256':meta['predicate_sha256'],'bundle_predicate_sha256':hashes,'exact_owner_predicate':meta['predicate_sha256'] in hashes,'attestation_id_present':bool(os.environ.get('ATTESTATION_ID'))},sort_keys=True,separators=(',',':')))
+          PY
+      - name: Attest collision second
+        id: second
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: owned-actions-attest-predicate-boundary
+          subject-digest: sha256:f74173fda9f3b0a8f18a6af4be3c2c91789e1365960b98fdb764f2187f35f351
+          predicate-type: https://controlled.invalid/predicate-path/v1
+          predicate-path: data/collision.json
+          show-summary: false
+      - name: Project collision second
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.second.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.second.outputs.attestation-id }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); meta=json.loads((root/'owner-meta.json').read_text()); hashes=[]; p=pathlib.Path(os.environ.get('BUNDLE_PATH',''))
+          if p.is_file():
+            for line in p.read_text().splitlines():
+              if line:
+                s=json.loads(base64.b64decode(json.loads(line)['dsseEnvelope']['payload'])); hashes.append(hashlib.sha256(json.dumps(s.get('predicate'),sort_keys=True,separators=(',',':')).encode()).hexdigest())
+          print('ATTEST_PREDICATE_PROJECTION '+json.dumps({'case':'collision-second','expected':'protected','outcome':'success','owner_predicate_sha256':meta['predicate_sha256'],'bundle_predicate_sha256':hashes,'exact_owner_predicate':meta['predicate_sha256'] in hashes,'attestation_id_present':bool(os.environ.get('ATTESTATION_ID'))},sort_keys=True,separators=(',',':')))
+          PY
